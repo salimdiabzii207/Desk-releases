@@ -1,0 +1,171 @@
+name: Construire et publier DIABZII Desk
+
+# Ce dépôt est public : ses minutes d'exécution sont gratuites. Il va chercher le code du dépôt privé
+# salimdiabzii207/DIABZII-Desk avec le secret RELEASES_TOKEN, construit l'installateur Windows et publie
+# la version ici. Le code reste privé ; seul le journal de construction est visible.
+#
+# Secret à créer (Settings, Secrets and variables, Actions) : RELEASES_TOKEN, une clé d'accès personnelle
+# « fine-grained » donnant, sur les deux dépôts salimdiabzii207/DIABZII-Desk et salimdiabzii207/Desk-releases,
+# les permissions Contents : Read and write.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'patch, minor, major ou un numéro comme 0.13.16'
+        required: false
+        default: 'patch'
+      ref:
+        description: 'Branche du dépôt privé'
+        required: false
+        default: 'ocr-engine'
+
+permissions:
+  contents: read
+
+env:
+  SOURCE: salimdiabzii207/DIABZII-Desk
+  DEPOT: salimdiabzii207/Desk-releases
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.RELEASES_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Construire les paquets
+        run: npm run build -w @diabzii/templates -w @diabzii/ocr
+      - run: npm run tessdata -w @diabzii/desk-app
+      - run: npm test
+      - name: Construire et tester les pages de l'éditeur web
+        run: |
+          npm run build -w @diabzii/mihbara
+          npx playwright install --with-deps chromium
+          node packages/mihbara/scripts/test-editor.mjs
+
+  publication:
+    needs: tests
+    runs-on: windows-latest
+    concurrency:
+      group: publication
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Le jeton n'est pas laissé dans .git : les scripts d'installation des dépendances ne peuvent pas s'en servir.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.RELEASES_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Augmenter le numéro de version
+        if: inputs.version != ''
+        env:
+          DEMANDE: ${{ inputs.version }}
+          BRANCHE: ${{ inputs.ref }}
+          GH_PUSH: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          [[ "$DEMANDE" =~ ^(patch|minor|major|[0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "Version demandée invalide : $DEMANDE"; exit 1; }
+          npm version "$DEMANDE" --no-git-tag-version -w @diabzii/desk-app
+          v=$(node -p "require('./apps/desktop/package.json').version")
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Version $v"
+          git push "https://x-access-token:${GH_PUSH}@github.com/${SOURCE}.git" "HEAD:${BRANCHE}"
+
+      # Absente : publier. Brouillon ou incomplète : supprimer et refaire.
+      - name: Nouvelle version à publier ?
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          v=$(node -p "require('./apps/desktop/package.json').version")
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+          if ! info=$(gh release view "v$v" --repo "$DEPOT" --json isDraft,assets --jq '"\(.isDraft) \(.assets | map(.name) | join(" "))"' 2>/dev/null); then
+            echo "Publication de la version v$v."
+            echo "publier=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          complete=true
+          for f in "DIABZII-Desk-Setup-$v.exe" "DIABZII-Desk-Setup-$v.exe.blockmap" latest.yml; do
+            [[ " $info " == *" $f "* ]] || complete=false
+          done
+          if [[ "$info" == false* && "$complete" == true ]]; then
+            echo "La version v$v est déjà publiée et complète : rien à faire."
+            echo "publier=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "La version v$v existe mais est en brouillon ou incomplète : elle est refaite."
+            gh release delete "v$v" --repo "$DEPOT" --yes --cleanup-tag
+            echo "publier=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Construire l'installateur
+        if: steps.version.outputs.publier == 'true'
+        run: |
+          npm run tessdata -w @diabzii/desk-app
+          npm run build -w @diabzii/desk-app
+          npx electron-builder --projectDir apps/desktop --win nsis --x64 --publish never
+
+      - name: Tester l'application construite
+        if: steps.version.outputs.publier == 'true'
+        run: node apps/desktop/scripts/smoke.mjs
+
+      - name: Vérifier les fichiers de la version
+        if: steps.version.outputs.publier == 'true'
+        env:
+          V: ${{ steps.version.outputs.v }}
+        run: node apps/desktop/scripts/verify-release.mjs apps/desktop/release "$V"
+
+      # La version reste en brouillon (invisible des postes) tant que les 3 fichiers ne sont pas en ligne.
+      - name: Mettre en ligne la version
+        if: steps.version.outputs.publier == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          V: ${{ steps.version.outputs.v }}
+        run: |
+          # Notes fixes : ce dépôt est public, aucun message interne n'y est recopié.
+          {
+            echo "Version $V"
+            echo
+            echo "Installateur Windows de DIABZII Desk $V. Les postes déjà installés se mettent à jour seuls."
+          } > "$RUNNER_TEMP/notes.md"
+          cd apps/desktop/release
+          gh release create "v$V" "DIABZII-Desk-Setup-$V.exe" "DIABZII-Desk-Setup-$V.exe.blockmap" latest.yml \
+            --repo "$DEPOT" --draft --title "DIABZII Desk $V" --notes-file "$RUNNER_TEMP/notes.md"
+          n=$(gh release view "v$V" --repo "$DEPOT" --json assets --jq '.assets | length')
+          test "$n" = 3 || { echo "Brouillon incomplet : $n fichier(s) sur 3"; exit 1; }
+          gh release edit "v$V" --repo "$DEPOT" --draft=false --latest
+
+      - name: Vérifier le flux public de mise à jour
+        if: steps.version.outputs.publier == 'true'
+        env:
+          V: ${{ steps.version.outputs.v }}
+        run: |
+          for i in 1 2 3 4 5 6; do
+            annonce=$(curl -sfL "https://github.com/$DEPOT/releases/latest/download/latest.yml" | sed -n 's/^version: *//p' | tr -d "'\r")
+            [ "$annonce" = "$V" ] && { echo "Les postes voient maintenant la version $V."; exit 0; }
+            echo "Flux public : ${annonce:-indisponible}, nouvel essai dans 20 s"
+            sleep 20
+          done
+          echo "Le flux public n'annonce pas la version $V"
+          exit 1
